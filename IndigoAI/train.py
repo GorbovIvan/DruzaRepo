@@ -1,106 +1,203 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
+import jax
+import jax.numpy as jnp
+import flax.linen as nn
+import optax
+import numpy as np
 from PIL import Image
 import os
-import numpy as np
+import pickle
 import matplotlib.pyplot as plt
-from sklearn.model_selection import train_test_split
 from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+from typing import Tuple, List, Dict
 import json
 from datetime import datetime
 
 # ==================== АРХИТЕКТУРА НЕЙРОСЕТИ ====================
 class ImageClassifier(nn.Module):
-    """Сверточная нейросеть для классификации изображений"""
+    """Сверточная нейросеть на Flax для классификации изображений"""
+    num_classes: int
     
-    def __init__(self, num_classes=10):
-        super(ImageClassifier, self).__init__()
-        
+    @nn.compact
+    def __call__(self, x, training=True):
         # Сверточные слои
-        self.features = nn.Sequential(
-            # Блок 1
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),
-            
-            # Блок 2
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),
-            
-            # Блок 3
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),
-            
-            # Блок 4
-            nn.Conv2d(128, 256, kernel_size=3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),
-        )
+        x = nn.Conv(features=32, kernel_size=(3, 3), padding='SAME')(x)
+        x = nn.BatchNorm(use_running_average=not training)(x)
+        x = nn.relu(x)
+        x = nn.max_pool(x, window_shape=(2, 2), strides=(2, 2))
         
-        # Классификатор
-        self.classifier = nn.Sequential(
-            nn.AdaptiveAvgPool2d((7, 7)),
-            nn.Flatten(),
-            nn.Dropout(0.5),
-            nn.Linear(256 * 7 * 7, 512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.3),
-            nn.Linear(512, 256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, num_classes)
-        )
-    
-    def forward(self, x):
-        x = self.features(x)
-        x = self.classifier(x)
+        x = nn.Conv(features=64, kernel_size=(3, 3), padding='SAME')(x)
+        x = nn.BatchNorm(use_running_average=not training)(x)
+        x = nn.relu(x)
+        x = nn.max_pool(x, window_shape=(2, 2), strides=(2, 2))
+        
+        x = nn.Conv(features=128, kernel_size=(3, 3), padding='SAME')(x)
+        x = nn.BatchNorm(use_running_average=not training)(x)
+        x = nn.relu(x)
+        x = nn.max_pool(x, window_shape=(2, 2), strides=(2, 2))
+        
+        x = nn.Conv(features=256, kernel_size=(3, 3), padding='SAME')(x)
+        x = nn.BatchNorm(use_running_average=not training)(x)
+        x = nn.relu(x)
+        x = nn.max_pool(x, window_shape=(2, 2), strides=(2, 2))
+        
+        # Глобальный пулинг и классификатор
+        x = jnp.mean(x, axis=(1, 2))  # Global Average Pooling
+        x = nn.Dropout(rate=0.5, deterministic=not training)(x)
+        x = nn.Dense(features=512)(x)
+        x = nn.relu(x)
+        x = nn.Dropout(rate=0.3, deterministic=not training)(x)
+        x = nn.Dense(features=256)(x)
+        x = nn.relu(x)
+        x = nn.Dense(features=self.num_classes)(x)
+        
         return x
 
-# ==================== КЛАСС ДЛЯ РАБОТЫ С ДАННЫМИ ====================
-class ImageDataset(Dataset):
-    """Датасет для загрузки изображений"""
+# ==================== ФУНКЦИИ ДЛЯ РАБОТЫ С ДАННЫМИ ====================
+
+def load_dataset(data_dir: str) -> Tuple[List[str], List[int], List[str]]:
+    """
+    Загрузка датасета из папок
+    """
+    image_paths = []
+    labels = []
+    class_names = []
     
-    def __init__(self, image_paths, labels, transform=None):
-        self.image_paths = image_paths
-        self.labels = labels
-        self.transform = transform
+    for class_name in sorted(os.listdir(data_dir)):
+        class_dir = os.path.join(data_dir, class_name)
+        if os.path.isdir(class_dir):
+            class_names.append(class_name)
+            
+            for img_name in os.listdir(class_dir):
+                if img_name.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
+                    img_path = os.path.join(class_dir, img_name)
+                    image_paths.append(img_path)
+                    labels.append(len(class_names) - 1)
     
-    def __len__(self):
-        return len(self.image_paths)
+    return image_paths, labels, class_names
+
+def preprocess_image(image_path: str, img_size: int = 224, augment: bool = False) -> jnp.ndarray:
+    """
+    Предобработка изображения с опциональной аугментацией
+    """
+    # Загрузка изображения
+    image = Image.open(image_path).convert('RGB')
     
-    def __getitem__(self, idx):
-        # Загрузка изображения
-        image = Image.open(self.image_paths[idx]).convert('RGB')
-        label = self.labels[idx]
+    # Аугментация для обучения
+    if augment:
+        # Случайное горизонтальное отражение
+        if np.random.random() > 0.5:
+            image = image.transpose(Image.FLIP_LEFT_RIGHT)
         
-        # Применение трансформаций
-        if self.transform:
-            image = self.transform(image)
+        # Случайное вращение
+        angle = np.random.randint(-10, 10)
+        image = image.rotate(angle, expand=False)
         
-        return image, label
+        # Случайное изменение яркости
+        brightness = np.random.uniform(0.8, 1.2)
+        image = image.point(lambda p: p * brightness)
+    
+    # Изменение размера
+    image = image.resize((img_size, img_size))
+    
+    # Преобразование в массив и нормализация
+    image = np.array(image) / 255.0
+    
+    # Стандартизация
+    mean = np.array([0.485, 0.456, 0.406])
+    std = np.array([0.229, 0.224, 0.225])
+    image = (image - mean) / std
+    
+    # Транспонирование для формата (H, W, C) -> (C, H, W)
+    image = np.transpose(image, (2, 0, 1))
+    
+    return jnp.array(image)
+
+def create_batches(image_paths: List[str], labels: List[int], 
+                   batch_size: int, augment: bool = False):
+    """
+    Создание батчей для обучения
+    """
+    num_samples = len(image_paths)
+    indices = np.arange(num_samples)
+    
+    while True:
+        if augment:
+            np.random.shuffle(indices)
+        
+        for i in range(0, num_samples, batch_size):
+            batch_indices = indices[i:i + batch_size]
+            batch_images = []
+            batch_labels = []
+            
+            for idx in batch_indices:
+                img = preprocess_image(image_paths[idx], augment=augment)
+                batch_images.append(img)
+                batch_labels.append(labels[idx])
+            
+            yield jnp.stack(batch_images), jnp.array(batch_labels)
+
+# ==================== ФУНКЦИИ ПОТЕРЬ И МЕТРИК ====================
+
+def cross_entropy_loss(logits: jnp.ndarray, labels: jnp.ndarray) -> jnp.ndarray:
+    """Функция потерь - кросс-энтропия"""
+    one_hot = jax.nn.one_hot(labels, logits.shape[-1])
+    return -jnp.mean(jnp.sum(one_hot * jax.nn.log_softmax(logits), axis=-1))
+
+def compute_accuracy(logits: jnp.ndarray, labels: jnp.ndarray) -> jnp.ndarray:
+    """Вычисление точности"""
+    predictions = jnp.argmax(logits, axis=-1)
+    return jnp.mean(predictions == labels)
+
+# ==================== ФУНКЦИИ ДЛЯ ОБУЧЕНИЯ ====================
+
+def create_train_state(rng, model, learning_rate: float, num_classes: int):
+    """Создание состояния обучения"""
+    dummy_input = jnp.ones((1, 3, 224, 224))
+    params = model.init(rng, dummy_input, training=False)['params']
+    
+    # Создание оптимизатора
+    tx = optax.adam(learning_rate)
+    opt_state = tx.init(params)
+    
+    return params, opt_state, tx
+
+@jax.jit
+def train_step(params, opt_state, tx, batch_images, batch_labels):
+    """Один шаг обучения (JIT-компилируется)"""
+    
+    def loss_fn(params):
+        logits = model.apply({'params': params}, batch_images, training=True)
+        loss = cross_entropy_loss(logits, batch_labels)
+        return loss, logits
+    
+    # Вычисление градиентов
+    (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+    
+    # Обновление параметров
+    updates, opt_state = tx.update(grads, opt_state, params)
+    params = optax.apply_updates(params, updates)
+    
+    # Вычисление метрик
+    accuracy = compute_accuracy(logits, batch_labels)
+    
+    return params, opt_state, loss, accuracy
+
+@jax.jit
+def eval_step(params, batch_images, batch_labels):
+    """Шаг валидации"""
+    logits = model.apply({'params': params}, batch_images, training=False)
+    loss = cross_entropy_loss(logits, batch_labels)
+    accuracy = compute_accuracy(logits, batch_labels)
+    return loss, accuracy
 
 # ==================== КЛАСС ДЛЯ ОБУЧЕНИЯ ====================
-class Trainer:
-    """Класс для обучения нейросети"""
+class JAXTrainer:
+    """Класс для обучения модели на JAX"""
     
-    def __init__(self, model, device, learning_rate=0.001):
-        self.model = model.to(device)
-        self.device = device
-        self.criterion = nn.CrossEntropyLoss()
-        self.optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='min', factor=0.5, patience=3, verbose=True
-        )
-        
-        # История обучения
+    def __init__(self, model, learning_rate: float = 0.001):
+        self.model = model
+        self.learning_rate = learning_rate
         self.history = {
             'train_loss': [],
             'train_acc': [],
@@ -108,78 +205,26 @@ class Trainer:
             'val_acc': []
         }
     
-    def train_epoch(self, train_loader):
-        """Обучение на одной эпохе"""
-        self.model.train()
-        running_loss = 0.0
-        correct = 0
-        total = 0
-        
-        pbar = tqdm(train_loader, desc='Обучение')
-        for images, labels in pbar:
-            images, labels = images.to(self.device), labels.to(self.device)
-            
-            # Forward pass
-            outputs = self.model(images)
-            loss = self.criterion(outputs, labels)
-            
-            # Backward pass
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-            
-            # Статистика
-            running_loss += loss.item()
-            _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
-            
-            # Обновление прогресс-бара
-            pbar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'acc': f'{100.*correct/total:.2f}%'
-            })
-        
-        epoch_loss = running_loss / len(train_loader)
-        epoch_acc = 100. * correct / total
-        
-        return epoch_loss, epoch_acc
-    
-    def validate(self, val_loader):
-        """Валидация модели"""
-        self.model.eval()
-        running_loss = 0.0
-        correct = 0
-        total = 0
-        
-        with torch.no_grad():
-            for images, labels in tqdm(val_loader, desc='Валидация'):
-                images, labels = images.to(self.device), labels.to(self.device)
-                
-                outputs = self.model(images)
-                loss = self.criterion(outputs, labels)
-                
-                running_loss += loss.item()
-                _, predicted = outputs.max(1)
-                total += labels.size(0)
-                correct += predicted.eq(labels).sum().item()
-        
-        val_loss = running_loss / len(val_loader)
-        val_acc = 100. * correct / total
-        
-        return val_loss, val_acc
-    
-    def train(self, train_loader, val_loader, epochs=30, save_path='best_model.pth'):
+    def train(self, train_paths: List[str], train_labels: List[int],
+              val_paths: List[str], val_labels: List[int],
+              num_classes: int, batch_size: int = 32,
+              epochs: int = 30, save_path: str = 'jax_best_model.pkl'):
         """
-        Полный цикл обучения
-        
-        Args:
-            train_loader: загрузчик обучающих данных
-            val_loader: загрузчик валидационных данных
-            epochs: количество эпох
-            save_path: путь для сохранения лучшей модели
+        Обучение модели
         """
-        best_val_acc = 0
+        # Инициализация
+        rng = jax.random.PRNGKey(0)
+        self.params, self.opt_state, self.tx = create_train_state(
+            rng, self.model, self.learning_rate, num_classes
+        )
+        
+        # Создание генераторов батчей
+        train_gen = create_batches(train_paths, train_labels, batch_size, augment=True)
+        val_gen = create_batches(val_paths, val_labels, batch_size, augment=False)
+        
+        # Метрики для валидации
+        num_val_batches = len(val_paths) // batch_size + 1
+        best_val_acc = 0.0
         patience_counter = 0
         early_stop_patience = 7
         
@@ -187,36 +232,68 @@ class Trainer:
         print("=" * 60)
         
         for epoch in range(epochs):
-            print(f'\nЭпоха {epoch+1}/{epochs}')
-            print("-" * 40)
-            
             # Обучение
-            train_loss, train_acc = self.train_epoch(train_loader)
-            self.history['train_loss'].append(train_loss)
-            self.history['train_acc'].append(train_acc)
+            epoch_train_loss = []
+            epoch_train_acc = []
+            
+            num_batches = len(train_paths) // batch_size
+            pbar = tqdm(range(num_batches), desc=f'Эпоха {epoch+1}/{epochs}')
+            
+            for _ in pbar:
+                batch_images, batch_labels = next(train_gen)
+                
+                self.params, self.opt_state, loss, acc = train_step(
+                    self.params, self.opt_state, self.tx, 
+                    batch_images, batch_labels
+                )
+                
+                epoch_train_loss.append(float(loss))
+                epoch_train_acc.append(float(acc))
+                
+                pbar.set_postfix({
+                    'loss': f'{np.mean(epoch_train_loss[-10:]):.4f}',
+                    'acc': f'{np.mean(epoch_train_acc[-10:]):.2f}%'
+                })
+            
+            avg_train_loss = np.mean(epoch_train_loss)
+            avg_train_acc = np.mean(epoch_train_acc)
             
             # Валидация
-            val_loss, val_acc = self.validate(val_loader)
-            self.history['val_loss'].append(val_loss)
-            self.history['val_acc'].append(val_acc)
+            val_losses = []
+            val_accs = []
             
-            # Обновление learning rate
-            self.scheduler.step(val_loss)
+            for _ in range(num_val_batches):
+                try:
+                    batch_images, batch_labels = next(val_gen)
+                    loss, acc = eval_step(self.params, batch_images, batch_labels)
+                    val_losses.append(float(loss))
+                    val_accs.append(float(acc))
+                except StopIteration:
+                    break
+            
+            avg_val_loss = np.mean(val_losses)
+            avg_val_acc = np.mean(val_accs)
+            
+            # Сохранение истории
+            self.history['train_loss'].append(avg_train_loss)
+            self.history['train_acc'].append(avg_train_acc)
+            self.history['val_loss'].append(avg_val_loss)
+            self.history['val_acc'].append(avg_val_acc)
             
             # Вывод результатов
             print(f"\nРезультаты эпохи {epoch+1}:")
-            print(f"  Обучение - Loss: {train_loss:.4f}, Acc: {train_acc:.2f}%")
-            print(f"  Валидация - Loss: {val_loss:.4f}, Acc: {val_acc:.2f}%")
+            print(f"  Обучение - Loss: {avg_train_loss:.4f}, Acc: {avg_train_acc:.2f}%")
+            print(f"  Валидация - Loss: {avg_val_loss:.4f}, Acc: {avg_val_acc:.2f}%")
             
             # Сохранение лучшей модели
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                torch.save(self.model.state_dict(), save_path)
-                print(f"  ✓ Новая лучшая модель! Точность: {val_acc:.2f}%")
+            if avg_val_acc > best_val_acc:
+                best_val_acc = avg_val_acc
+                self.save_model(save_path)
+                print(f"  ✓ Новая лучшая модель! Точность: {avg_val_acc:.2f}%")
                 patience_counter = 0
             else:
                 patience_counter += 1
-                
+            
             # Ранняя остановка
             if patience_counter >= early_stop_patience:
                 print(f"\nРанняя остановка на эпохе {epoch+1}")
@@ -225,16 +302,13 @@ class Trainer:
         print("\n" + "=" * 60)
         print(f"Обучение завершено! Лучшая точность: {best_val_acc:.2f}%")
         
-        # Сохранение истории обучения
-        self.save_history()
-        
         return self.history
     
-    def save_history(self, filename='training_history.json'):
-        """Сохранение истории обучения"""
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(self.history, f, indent=4)
-        print(f"История обучения сохранена в {filename}")
+    def save_model(self, path: str):
+        """Сохранение модели"""
+        with open(path, 'wb') as f:
+            pickle.dump(self.params, f)
+        print(f"✓ Модель сохранена в {path}")
     
     def plot_history(self):
         """Визуализация процесса обучения"""
@@ -259,67 +333,8 @@ class Trainer:
         ax2.grid(True, alpha=0.3)
         
         plt.tight_layout()
-        plt.savefig('training_history.png', dpi=150, bbox_inches='tight')
+        plt.savefig('jax_training_history.png', dpi=150, bbox_inches='tight')
         plt.show()
-
-# ==================== ФУНКЦИИ ДЛЯ ПОДГОТОВКИ ДАННЫХ ====================
-
-def load_dataset(data_dir):
-    """
-    Загрузка датасета из папок
-    
-    Args:
-        data_dir: путь к папке с датасетом
-    
-    Returns:
-        image_paths: список путей к изображениям
-        labels: список меток
-        class_names: список названий классов
-    """
-    image_paths = []
-    labels = []
-    class_names = []
-    
-    # Получаем все классы (папки)
-    for class_name in sorted(os.listdir(data_dir)):
-        class_dir = os.path.join(data_dir, class_name)
-        if os.path.isdir(class_dir):
-            class_names.append(class_name)
-            
-            # Загружаем изображения из папки класса
-            for img_name in os.listdir(class_dir):
-                if img_name.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
-                    img_path = os.path.join(class_dir, img_name)
-                    image_paths.append(img_path)
-                    labels.append(len(class_names) - 1)
-    
-    return image_paths, labels, class_names
-
-def get_transforms():
-    """Получение трансформаций для обучения и валидации"""
-    
-    # Трансформации для обучения (с аугментацией)
-    train_transform = transforms.Compose([
-        transforms.Resize((256, 256)),
-        transforms.RandomCrop(224),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomRotation(10),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, 
-                              saturation=0.2, hue=0.1),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                           std=[0.229, 0.224, 0.225])
-    ])
-    
-    # Трансформации для валидации (без аугментации)
-    val_transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                           std=[0.229, 0.224, 0.225])
-    ])
-    
-    return train_transform, val_transform
 
 # ==================== ОСНОВНАЯ ФУНКЦИЯ ОБУЧЕНИЯ ====================
 
@@ -336,12 +351,11 @@ def main():
     
     # Создание папки для сохранения результатов
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_dir = f"training_{timestamp}"
+    save_dir = f"jax_training_{timestamp}"
     os.makedirs(save_dir, exist_ok=True)
     
-    # Проверка доступности GPU
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Используется устройство: {device}")
+    # Установка случайного seed
+    np.random.seed(RANDOM_SEED)
     
     # Загрузка данных
     print("\nЗагрузка датасета...")
@@ -351,16 +365,13 @@ def main():
         print("  dataset/")
         print("    класс1/")
         print("      image1.jpg")
-        print("      image2.jpg")
         print("    класс2/")
-        print("      image1.jpg")
-        print("      image2.jpg")
         return
     
     image_paths, labels, class_names = load_dataset(DATA_DIR)
     
     if len(image_paths) == 0:
-        print("Ошибка: Не найдено изображений в датасете!")
+        print("Ошибка: Не найдено изображений!")
         return
     
     print(f"Найдено изображений: {len(image_paths)}")
@@ -387,65 +398,37 @@ def main():
     print(f"\nРазмер обучающей выборки: {len(train_paths)}")
     print(f"Размер валидационной выборки: {len(val_paths)}")
     
-    # Получение трансформаций
-    train_transform, val_transform = get_transforms()
-    
-    # Создание датасетов
-    train_dataset = ImageDataset(train_paths, train_labels, transform=train_transform)
-    val_dataset = ImageDataset(val_paths, val_labels, transform=val_transform)
-    
-    # Создание загрузчиков данных
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=BATCH_SIZE, 
-        shuffle=True,
-        num_workers=2,
-        pin_memory=True
-    )
-    
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=BATCH_SIZE, 
-        shuffle=False,
-        num_workers=2,
-        pin_memory=True
-    )
-    
     # Создание модели
     print("\nСоздание модели...")
     model = ImageClassifier(num_classes=len(class_names))
     
-    # Подсчет количества параметров
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Всего параметров: {total_params:,}")
-    print(f"Обучаемых параметров: {trainable_params:,}")
-    
     # Создание тренера
-    trainer = Trainer(model, device, learning_rate=LEARNING_RATE)
+    trainer = JAXTrainer(model, learning_rate=LEARNING_RATE)
     
     # Обучение
     print("\nНачинаем обучение...")
-    save_path = os.path.join(save_dir, 'best_model.pth')
-    history = trainer.train(train_loader, val_loader, epochs=EPOCHS, save_path=save_path)
+    save_path = os.path.join(save_dir, 'jax_best_model.pkl')
+    history = trainer.train(
+        train_paths, train_labels,
+        val_paths, val_labels,
+        num_classes=len(class_names),
+        batch_size=BATCH_SIZE,
+        epochs=EPOCHS,
+        save_path=save_path
+    )
     
     # Визуализация результатов
     print("\nВизуализация результатов обучения...")
     trainer.plot_history()
     
-    # Сохранение истории в папку
-    import shutil
-    shutil.move('training_history.json', os.path.join(save_dir, 'training_history.json'))
-    shutil.move('training_history.png', os.path.join(save_dir, 'training_history.png'))
+    # Сохранение истории
+    with open(os.path.join(save_dir, 'history.json'), 'w') as f:
+        json.dump({k: [float(v) for v in vals] for k, vals in history.items()}, f)
     
-    print(f"\n✓ Обучение завершено!")
-    print(f"✓ Модель сохранена в: {save_path}")
-    print(f"✓ Результаты сохранены в папке: {save_dir}")
-    
-    # Создание файла с информацией об обучении
+    # Сохранение информации об обучении
     training_info = {
         'timestamp': timestamp,
-        'device': str(device),
+        'framework': 'JAX/Flax',
         'batch_size': BATCH_SIZE,
         'epochs': EPOCHS,
         'learning_rate': LEARNING_RATE,
@@ -453,61 +436,66 @@ def main():
         'num_classes': len(class_names),
         'train_size': len(train_paths),
         'val_size': len(val_paths),
-        'best_val_acc': max(history['val_acc']),
-        'best_epoch': history['val_acc'].index(max(history['val_acc'])) + 1
+        'best_val_acc': float(max(history['val_acc'])),
+        'best_epoch': int(np.argmax(history['val_acc']) + 1)
     }
     
     with open(os.path.join(save_dir, 'training_info.json'), 'w', encoding='utf-8') as f:
         json.dump(training_info, f, indent=4, ensure_ascii=False)
-
-# ==================== ТЕСТИРОВАНИЕ МОДЕЛИ ПОСЛЕ ОБУЧЕНИЯ ====================
-
-def test_model(model_path, class_names, test_image_path):
-    """Тестирование обученной модели на одном изображении"""
     
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"\n✓ Обучение завершено!")
+    print(f"✓ Модель сохранена в: {save_path}")
+    print(f"✓ Результаты сохранены в папке: {save_dir}")
+
+# ==================== ТЕСТИРОВАНИЕ МОДЕЛИ ====================
+
+def test_model(model_path: str, class_names: List[str], test_image_path: str):
+    """Тестирование обученной модели"""
     
-    # Загрузка модели
+    # Создание модели
     model = ImageClassifier(num_classes=len(class_names))
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    model = model.to(device)
-    model.eval()
     
-    # Трансформации
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                           std=[0.229, 0.224, 0.225])
-    ])
+    # Загрузка параметров
+    with open(model_path, 'rb') as f:
+        params = pickle.load(f)
     
-    # Загрузка и предсказание
-    image = Image.open(test_image_path).convert('RGB')
-    image_tensor = transform(image).unsqueeze(0).to(device)
+    # Функция предсказания
+    @jax.jit
+    def predict(params, image):
+        logits = model.apply({'params': params}, image, training=False)
+        return jax.nn.softmax(logits)
     
-    with torch.no_grad():
-        outputs = model(image_tensor)
-        probabilities = torch.nn.functional.softmax(outputs, dim=1)
-        top_prob, top_class = torch.topk(probabilities, 3)
+    # Предобработка изображения
+    from jax_inference import preprocess_image
+    image = preprocess_image(test_image_path)
     
-    # Вывод результатов
+    # Предсказание
+    probabilities = predict(params, image)[0]
+    
+    # Топ-3 предсказания
+    top_indices = jnp.argsort(probabilities)[::-1][:3]
+    
     print("\nРезультаты тестирования:")
-    for i in range(3):
-        class_idx = top_class[0][i].item()
-        prob = top_prob[0][i].item()
-        print(f"  {i+1}. {class_names[class_idx]}: {prob*100:.2f}%")
+    for i, idx in enumerate(top_indices):
+        idx = int(idx)
+        prob = float(probabilities[idx])
+        print(f"{i+1}. {class_names[idx]}: {prob*100:.2f}%")
     
     # Визуализация
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+    image = Image.open(test_image_path)
+    plt.figure(figsize=(10, 5))
     
-    ax1.imshow(image)
-    ax1.set_title(f"Предсказание: {class_names[top_class[0][0].item()]}")
-    ax1.axis('off')
+    plt.subplot(1, 2, 1)
+    plt.imshow(image)
+    plt.title("Тестовое изображение")
+    plt.axis('off')
     
-    probs = probabilities[0].cpu().numpy()
-    ax2.barh(class_names, probs)
-    ax2.set_xlabel('Вероятность')
-    ax2.set_title('Вероятности классов')
+    plt.subplot(1, 2, 2)
+    probs = np.array(probabilities)
+    classes = class_names
+    plt.barh(classes, probs)
+    plt.xlabel('Вероятность')
+    plt.title('Предсказания модели')
     
     plt.tight_layout()
     plt.show()
@@ -517,4 +505,4 @@ if __name__ == "__main__":
     main()
     
     # Раскомментируйте для тестирования после обучения
-    # test_model('best_model.pth', class_names, 'test_image.jpg')
+    # test_model('jax_best_model.pkl', class_names, 'test_image.jpg')
