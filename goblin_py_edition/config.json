@@ -1,0 +1,8 @@
+{
+    "device": "laptop",
+    "separator": {
+        "pc": {"symbol": "#", "count": 40},
+        "laptop": {"symbol": "=", "count": 168},
+        "mobile": {"symbol": "-", "count": 40}
+    }
+}
