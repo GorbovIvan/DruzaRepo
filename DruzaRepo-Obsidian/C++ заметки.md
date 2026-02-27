@@ -1,0 +1,2 @@
+- https://metanit.com/cpp/tutorial/
+- Для строк:  #includes<iostream>
