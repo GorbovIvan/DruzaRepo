@@ -1,39 +1,54 @@
 import os
 import glob
 
-def rename_jpeg_to_dog(folder_path):
+def rename_images_to_dog(folder_path, include_png=False):
     """
-    Переименовывает все JPEG файлы в указанной папке в формат dog_1.jpeg, dog_2.jpeg и т.д.
+    Переименовывает все JPEG и опционально PNG файлы в формат dog_1.jpeg, dog_2.jpeg и т.д.
     
     Args:
         folder_path (str): Путь к папке с фотографиями
+        include_png (bool): Включать ли PNG файлы в переименование
     """
     
-    # Поиск всех JPEG файлов (регистронезависимый)
-    jpeg_files = []
+    # Поиск всех файлов изображений
+    image_files = []
     
-    # Различные варианты расширений JPEG
+    # Расширения для поиска
     extensions = ['*.jpeg', '*.jpg', '*.JPEG', '*.JPG']
     
+    # Добавляем PNG если нужно
+    if include_png:
+        extensions.extend(['*.png', '*.PNG'])
+    
+    # Собираем все файлы
     for ext in extensions:
-        jpeg_files.extend(glob.glob(os.path.join(folder_path, ext)))
+        image_files.extend(glob.glob(os.path.join(folder_path, ext)))
     
     # Сортировка файлов для последовательной нумерации
-    jpeg_files.sort()
+    image_files.sort()
     
-    if not jpeg_files:
-        print("JPEG файлы не найдены в указанной папке")
+    if not image_files:
+        print("Файлы изображений не найдены в указанной папке")
         return
     
-    print(f"Найдено {len(jpeg_files)} JPEG файлов")
+    # Подсчет файлов по типам
+    jpeg_count = sum(1 for f in image_files if f.lower().endswith(('.jpg', '.jpeg')))
+    png_count = sum(1 for f in image_files if f.lower().endswith('.png'))
+    
+    print(f"Найдено файлов: всего {len(image_files)}")
+    if jpeg_count > 0:
+        print(f"  - JPEG: {jpeg_count}")
+    if png_count > 0:
+        print(f"  - PNG: {png_count}")
+    print()
     
     # Переименование файлов
-    for index, file_path in enumerate(jpeg_files, start=1):
+    for index, file_path in enumerate(image_files, start=1):
         # Получаем директорию и расширение файла
         directory = os.path.dirname(file_path)
         file_extension = os.path.splitext(file_path)[1]
         
-        # Новое имя файла
+        # Новое имя файла (сохраняем оригинальное расширение)
         new_name = f"dog_{index}{file_extension}"
         new_path = os.path.join(directory, new_name)
         
@@ -44,9 +59,10 @@ def rename_jpeg_to_dog(folder_path):
             print(f"Ошибка при переименовании {file_path}: {e}")
 
 def main():
+    print("=== Переименование изображений ===")
+    
     # Путь к папке с фотографиями
-    # Можно изменить на нужный путь или запросить у пользователя
-    folder_path = input("Введите путь к папке с фотографиями: ").strip()
+    folder_path = input("Введите путь к папке с изображениями: ").strip()
     
     # Убираем кавычки, если пользователь их вставил
     folder_path = folder_path.strip('"\'')
@@ -60,13 +76,27 @@ def main():
         print(f"Ошибка: '{folder_path}' не является папкой")
         return
     
+    # Спрашиваем про PNG
+    print("\nДоступные форматы:")
+    print("1. Только JPEG (включая .jpg, .jpeg)")
+    print("2. JPEG и PNG")
+    
+    format_choice = input("Выберите формат (1 или 2): ").strip()
+    
+    include_png = (format_choice == "2")
+    
+    # Показываем, какие файлы будут обработаны
+    print(f"\nБудут переименованы:")
+    print(f"  - JPEG файлы: Да")
+    print(f"  - PNG файлы: {'Да' if include_png else 'Нет'}")
+    print(f"В папке: {folder_path}")
+    
     # Запрос подтверждения
-    print(f"\nБудут переименованы все JPEG файлы в папке: {folder_path}")
-    confirm = input("Продолжить? (y/n): ").strip().lower()
+    confirm = input("\nПродолжить? (y/n): ").strip().lower()
     
     if confirm == 'y':
-        rename_jpeg_to_dog(folder_path)
-        print("Готово!")
+        rename_images_to_dog(folder_path, include_png)
+        print("\nГотово!")
     else:
         print("Операция отменена")
 
